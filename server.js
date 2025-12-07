@@ -178,7 +178,7 @@ wss.on('connection', async (twilioWs, req) => {
         session: {
           instructions: routerPrompt,
           modalities: ['audio', 'text'],
-          voice: 'alloy',
+          voice: 'verse',
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
