@@ -50,7 +50,7 @@ async function reloadPromptsFromDB() {
     const { data, error } = await supabase
       .from('cl_phone_agents')
       .select('slug, system_prompt')
-      .in('slug', ['router-dev', 'items-dev', 'locations'])
+      .in('slug', ['router-dev', 'item-dev', 'locations'])
 
     if (error) {
       console.error('[Prompts] Error loading from DB:', error)
@@ -59,7 +59,7 @@ async function reloadPromptsFromDB() {
 
     for (const row of data || []) {
       if (row.slug === 'router-dev') PROMPTS.router = row.system_prompt || ''
-      if (row.slug === 'items-dev') PROMPTS.items = row.system_prompt || ''
+      if (row.slug === 'item-dev') PROMPTS.items = row.system_prompt || ''
       if (row.slug === 'locations') PROMPTS.pickup = row.system_prompt || ''
     }
 
