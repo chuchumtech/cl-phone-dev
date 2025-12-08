@@ -334,6 +334,8 @@ wss.on('connection', async (twilioWs, req) => {
 
   // ---------------- OpenAI -> Twilio (via ElevenLabs TTS) ----------------
 
+   // ---------------- OpenAI -> Twilio (via ElevenLabs TTS) ----------------
+
   openaiWs.on('message', async (raw) => {
     const event = JSON.parse(raw.toString())
 
@@ -341,60 +343,45 @@ wss.on('connection', async (twilioWs, req) => {
       // ---- RESPONSE LIFECYCLE ----
       case 'response.created': {
         responseActive = true
+        // We'll build the full utterance from the transcript
         currentAssistantText = ''
         break
       }
 
-      // We IGNORE OpenAI audio deltas now; all audio comes from ElevenLabs.
+      // We IGNORE OpenAI audio bytes now; all audio comes from ElevenLabs.
       case 'response.audio.delta': {
-        // Do nothing; don't set isAssistantSpeaking here.
+        // Do nothing here on purpose
         break
       }
 
-      // If you still want transcripts for logging, you can keep this:
+      // Build up the assistant's spoken text from the transcript stream
       case 'response.audio_transcript.delta': {
-        // Optional: ignore or log
-        break
-      }
-
-      case 'response.audio_transcript.done': {
-        // Optional: ignore or log
-        break
-      }
-
-      case 'response.output_text.delta': {
-        // This is the assistant's text content; we accumulate it to send to ElevenLabs
         if (typeof event.delta === 'string') {
           currentAssistantText += event.delta
         }
         break
       }
 
-      case 'response.audio.done': {
-        // We don't use OpenAI audio; ignore
-        break
-      }
-
-      case 'response.done': {
-        responseActive = false
-
-        // When the model finishes a turn, speak the accumulated text via ElevenLabs
+      // When the transcript for this response is done, send it to ElevenLabs
+      case 'response.audio_transcript.done': {
         const textToSpeak = currentAssistantText.trim()
         if (textToSpeak) {
           console.log(`[Assistant][${currentAgent}]`, textToSpeak)
           await speakWithElevenLabs(textToSpeak)
         }
-
         currentAssistantText = ''
+        responseActive = false
+        // speakWithElevenLabs flips isAssistantSpeaking on/off around playback
         break
       }
 
-      // ---- TEXT OUT / optional JSON handoff ----
-      case 'response.output_text.delta': {
-        // Already handled above for TTS; but if duplicated here, guard:
-        if (typeof event.delta === 'string') {
-          currentAssistantText += event.delta
-        }
+      case 'response.audio.done': {
+        // We ignore OpenAI audio; ElevenLabs already handled playback.
+        break
+      }
+
+      case 'response.done': {
+        // We already handled speaking on transcript.done
         break
       }
 
