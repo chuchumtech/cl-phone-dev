@@ -15,6 +15,11 @@ const {
   ROUTER_ENDPOINT,
   ITEM_SEARCH_ENDPOINT,
   PICKUP_ENDPOINT, // POST endpoint for pickup lookup
+
+  // NEW: ElevenLabs
+  ELEVENLABS_API_KEY,
+  ELEVENLABS_VOICE_ID,
+  ELEVENLABS_MODEL_ID,
 } = process.env
 
 // ---------------------------------------------------------------------------
@@ -33,6 +38,9 @@ if (!ITEM_SEARCH_ENDPOINT) {
 }
 if (!PICKUP_ENDPOINT) {
   console.warn('[Warn] PICKUP_ENDPOINT not set – pickup tool will fail.')
+}
+if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+  console.warn('[Warn] ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID not set – TTS will fail.')
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +107,7 @@ const httpServer = http.createServer(async (req, res) => {
 })
 
 // ---------------------------------------------------------------------------
-// 3. WS SERVER (Twilio <-> OpenAI Realtime)
+// 3. WS SERVER (Twilio <-> OpenAI Realtime + ElevenLabs TTS)
 // ---------------------------------------------------------------------------
 
 const wss = new WebSocketServer({ server: httpServer })
@@ -139,7 +147,7 @@ wss.on('connection', async (twilioWs, req) => {
 
   // Response + logging helpers
   let responseActive = false
-  let currentAssistantTranscript = ''
+  let currentAssistantText = '' // text we will send to ElevenLabs
 
   // Map of function_call call_id -> toolName
   const functionCallMap = new Map()
@@ -164,6 +172,70 @@ wss.on('connection', async (twilioWs, req) => {
     openaiWs.send(JSON.stringify({ type: 'response.create' }))
   }
 
+  // --------------- ElevenLabs TTS helper ----------------
+
+  async function speakWithElevenLabs(text) {
+    if (!streamSid) {
+      console.warn('[TTS] No streamSid, cannot send audio to Twilio')
+      return
+    }
+    if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+      console.warn('[TTS] ElevenLabs env vars missing, skipping TTS')
+      return
+    }
+    if (!text || !text.trim()) return
+
+    try {
+      isAssistantSpeaking = true
+      console.log('[TTS] Synthesizing text with ElevenLabs:', text)
+
+      const modelId = ELEVENLABS_MODEL_ID || 'eleven_monolingual_v1'
+
+      // Request μ-law 8kHz audio suitable for Twilio
+      const ttsResp = await axios.post(
+        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+        {
+          text,
+          model_id: modelId,
+          // You can tune stability / clarity here as needed
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.85,
+          },
+        },
+        {
+          headers: {
+            'xi-api-key': ELEVENLABS_API_KEY,
+            Accept: 'audio/mulaw', // μ-law 8kHz (ElevenLabs supports Twilio-style)
+            'Content-Type': 'application/json',
+          },
+          responseType: 'arraybuffer',
+        }
+      )
+
+      const audioBuffer = Buffer.from(ttsResp.data)
+
+      // Twilio media stream: send small chunks (e.g. 160 bytes ~= 20 ms at 8kHz)
+      const FRAME_SIZE = 160
+      for (let i = 0; i < audioBuffer.length; i += FRAME_SIZE) {
+        const chunk = audioBuffer.subarray(i, i + FRAME_SIZE)
+        const b64 = chunk.toString('base64')
+
+        twilioWs.send(
+          JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: b64 },
+          })
+        )
+      }
+    } catch (err) {
+      console.error('[TTS] Error calling ElevenLabs:', err?.response?.data || err)
+    } finally {
+      isAssistantSpeaking = false
+    }
+  }
+
   // ---------------- OpenAI WS: on open ----------------
 
   openaiWs.on('open', () => {
@@ -177,7 +249,10 @@ wss.on('connection', async (twilioWs, req) => {
         type: 'session.update',
         session: {
           instructions: routerPrompt,
+          // We still accept audio input from Twilio to OpenAI,
+          // but we ignore OpenAI's audio output and synthesize with ElevenLabs.
           modalities: ['audio', 'text'],
+          // voice param not really used anymore, but harmless
           voice: 'cedar',
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
@@ -221,11 +296,12 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       if (msg.event === 'media') {
+        // Only send caller audio to OpenAI when assistant is not speaking
         if (!isAssistantSpeaking) {
           openaiWs.send(
             JSON.stringify({
               type: 'input_audio_buffer.append',
-              audio: msg.media.payload,
+              audio: msg.media.payload, // base64 g711_ulaw from Twilio
             })
           )
         }
@@ -256,7 +332,7 @@ wss.on('connection', async (twilioWs, req) => {
     } catch {}
   })
 
-  // ---------------- OpenAI -> Twilio ----------------
+  // ---------------- OpenAI -> Twilio (via ElevenLabs TTS) ----------------
 
   openaiWs.on('message', async (raw) => {
     const event = JSON.parse(raw.toString())
@@ -265,61 +341,59 @@ wss.on('connection', async (twilioWs, req) => {
       // ---- RESPONSE LIFECYCLE ----
       case 'response.created': {
         responseActive = true
-        currentAssistantTranscript = ''
+        currentAssistantText = ''
         break
       }
 
-      // ---- AUDIO OUT ----
+      // We IGNORE OpenAI audio deltas now; all audio comes from ElevenLabs.
       case 'response.audio.delta': {
-        isAssistantSpeaking = true
-        const b64 = event.delta
-        if (b64 && streamSid) {
-          twilioWs.send(
-            JSON.stringify({
-              event: 'media',
-              streamSid,
-              media: { payload: b64 },
-            })
-          )
-        } else if (!streamSid) {
-          console.warn('[Twilio] Missing streamSid, cannot send audio')
-        }
+        // Do nothing; don't set isAssistantSpeaking here.
         break
       }
 
+      // If you still want transcripts for logging, you can keep this:
       case 'response.audio_transcript.delta': {
-        if (typeof event.delta === 'string') {
-          currentAssistantTranscript += event.delta
-        }
+        // Optional: ignore or log
         break
       }
 
       case 'response.audio_transcript.done': {
-        if (currentAssistantTranscript.trim()) {
-          console.log(
-            `[Assistant][${currentAgent}]`,
-            currentAssistantTranscript.trim()
-          )
+        // Optional: ignore or log
+        break
+      }
+
+      case 'response.output_text.delta': {
+        // This is the assistant's text content; we accumulate it to send to ElevenLabs
+        if (typeof event.delta === 'string') {
+          currentAssistantText += event.delta
         }
         break
       }
 
       case 'response.audio.done': {
+        // We don't use OpenAI audio; ignore
         break
       }
 
       case 'response.done': {
         responseActive = false
-        isAssistantSpeaking = false
+
+        // When the model finishes a turn, speak the accumulated text via ElevenLabs
+        const textToSpeak = currentAssistantText.trim()
+        if (textToSpeak) {
+          console.log(`[Assistant][${currentAgent}]`, textToSpeak)
+          await speakWithElevenLabs(textToSpeak)
+        }
+
+        currentAssistantText = ''
         break
       }
 
       // ---- TEXT OUT / optional JSON handoff ----
       case 'response.output_text.delta': {
-        const text = event.delta
-        if (text && looksLikeHandoff(text)) {
-          const handoff = JSON.parse(text)
-          await handleHandoff(handoff)
+        // Already handled above for TTS; but if duplicated here, guard:
+        if (typeof event.delta === 'string') {
+          currentAssistantText += event.delta
         }
         break
       }
@@ -447,7 +521,7 @@ wss.on('connection', async (twilioWs, req) => {
             question: output.cleaned_question || null,
           })
         }
-
+        // orders etc can be added later
         return
       }
 
@@ -476,6 +550,7 @@ wss.on('connection', async (twilioWs, req) => {
           })
         )
 
+        // Items agent will generate text → ElevenLabs TTS will speak it
         openaiWs.send(JSON.stringify({ type: 'response.create' }))
         return
       }
@@ -514,7 +589,6 @@ wss.on('connection', async (twilioWs, req) => {
         const cleanedQuestion =
           typeof args.question === 'string' ? args.question : null
 
-        // Acknowledge the tool call (payload not used by the model)
         openaiWs.send(
           JSON.stringify({
             type: 'conversation.item.create',
