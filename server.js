@@ -193,24 +193,23 @@ wss.on('connection', async (twilioWs, req) => {
       const modelId = ELEVENLABS_MODEL_ID || 'eleven_monolingual_v1'
 
       const ttsResp = await axios.post(
-        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
-        {
-          text,
-          model_id: modelId,
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.85,
-          },
-        },
-        {
-          headers: {
-            'xi-api-key': ELEVENLABS_API_KEY,
-            Accept: 'audio/mulaw', // μ-law 8kHz (Twilio-friendly)
-            'Content-Type': 'application/json',
-          },
-          responseType: 'arraybuffer',
-        }
-      )
+  `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}?output_format=ulaw_8000`,
+  {
+    text,
+    model_id: modelId,
+    voice_settings: {
+      stability: 0.5,
+      similarity_boost: 0.85,
+    },
+  },
+  {
+    headers: {
+      'xi-api-key': ELEVENLABS_API_KEY,
+      'Content-Type': 'application/json',
+    },
+    responseType: 'arraybuffer',
+  }
+)
 
       const audioBuffer = Buffer.from(ttsResp.data)
 
