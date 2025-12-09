@@ -165,7 +165,7 @@ wss.on('connection', async (twilioWs, req) => {
         {
           text,
           model_id: modelId,
-          voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+          voice_settings: { stability: 0.7, similarity_boost: 0.5, style: 0.3 },
         },
         {
           headers: {
