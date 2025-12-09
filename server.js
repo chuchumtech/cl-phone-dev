@@ -44,7 +44,7 @@ async function reloadPromptsFromDB() {
     const { data, error } = await supabase
       .from('cl_phone_agents')
       .select('slug, system_prompt')
-      .in('slug', ['router-dev', 'item-dev', 'locations'])
+      .in('slug', ['router-dev', 'item-dev', 'locations-dev'])
 
     if (error) {
       console.error('[Prompts] Error loading from DB:', error)
@@ -59,7 +59,7 @@ async function reloadPromptsFromDB() {
     for (const row of data || []) {
       if (row.slug === 'router-dev') PROMPTS.router = row.system_prompt || ''
       if (row.slug === 'item-dev') PROMPTS.items = row.system_prompt || ''
-      if (row.slug === 'locations') PROMPTS.pickup = row.system_prompt || ''
+      if (row.slug === 'locations-dev') PROMPTS.pickup = row.system_prompt || ''
     }
     console.log('[Prompts] Reloaded active prompts')
   } catch (e) {
@@ -165,7 +165,7 @@ wss.on('connection', async (twilioWs, req) => {
         {
           text,
           model_id: modelId,
-          voice_settings: { stability: 0.4, similarity_boost: 0.75, style: 0.2, speed: 0.75 },
+          voice_settings: { stability: 0.76, similarity_boost: 0.65, style: 0.2, speed: 0.85 },
         },
         {
           headers: {
