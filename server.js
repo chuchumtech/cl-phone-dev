@@ -16,7 +16,7 @@ const {
   ITEM_SEARCH_ENDPOINT,
   PICKUP_ENDPOINT, // POST endpoint for pickup lookup
 
-  // NEW: ElevenLabs
+  // ElevenLabs
   ELEVENLABS_API_KEY,
   ELEVENLABS_VOICE_ID,
   ELEVENLABS_MODEL_ID,
@@ -191,13 +191,11 @@ wss.on('connection', async (twilioWs, req) => {
 
       const modelId = ELEVENLABS_MODEL_ID || 'eleven_monolingual_v1'
 
-      // Request μ-law 8kHz audio suitable for Twilio
       const ttsResp = await axios.post(
         `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
         {
           text,
           model_id: modelId,
-          // You can tune stability / clarity here as needed
           voice_settings: {
             stability: 0.5,
             similarity_boost: 0.85,
@@ -206,7 +204,7 @@ wss.on('connection', async (twilioWs, req) => {
         {
           headers: {
             'xi-api-key': ELEVENLABS_API_KEY,
-            Accept: 'audio/mulaw', // μ-law 8kHz (ElevenLabs supports Twilio-style)
+            Accept: 'audio/mulaw', // μ-law 8kHz, good for Twilio
             'Content-Type': 'application/json',
           },
           responseType: 'arraybuffer',
@@ -215,8 +213,10 @@ wss.on('connection', async (twilioWs, req) => {
 
       const audioBuffer = Buffer.from(ttsResp.data)
 
-      // Twilio media stream: send small chunks (e.g. 160 bytes ~= 20 ms at 8kHz)
-      const FRAME_SIZE = 160
+      // Twilio media stream: send ~20ms chunks with pacing
+      const FRAME_SIZE = 160 // 160 bytes ≈ 20ms at 8kHz μ-law
+      const FRAME_DURATION_MS = 20
+
       for (let i = 0; i < audioBuffer.length; i += FRAME_SIZE) {
         const chunk = audioBuffer.subarray(i, i + FRAME_SIZE)
         const b64 = chunk.toString('base64')
@@ -228,6 +228,9 @@ wss.on('connection', async (twilioWs, req) => {
             media: { payload: b64 },
           })
         )
+
+        // Pace the frames so Twilio plays them cleanly
+        await new Promise((resolve) => setTimeout(resolve, FRAME_DURATION_MS))
       }
     } catch (err) {
       console.error('[TTS] Error calling ElevenLabs:', err?.response?.data || err)
@@ -252,8 +255,7 @@ wss.on('connection', async (twilioWs, req) => {
           // We still accept audio input from Twilio to OpenAI,
           // but we ignore OpenAI's audio output and synthesize with ElevenLabs.
           modalities: ['audio', 'text'],
-          // voice param not really used anymore, but harmless
-          voice: 'cedar',
+          voice: 'cedar', // ignored for TTS, but fine to leave
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
@@ -332,9 +334,7 @@ wss.on('connection', async (twilioWs, req) => {
     } catch {}
   })
 
-  // ---------------- OpenAI -> Twilio (via ElevenLabs TTS) ----------------
-
-   // ---------------- OpenAI -> Twilio (via ElevenLabs TTS) ----------------
+  // ---------------- OpenAI -> (text) -> ElevenLabs -> Twilio ----------------
 
   openaiWs.on('message', async (raw) => {
     const event = JSON.parse(raw.toString())
@@ -343,45 +343,36 @@ wss.on('connection', async (twilioWs, req) => {
       // ---- RESPONSE LIFECYCLE ----
       case 'response.created': {
         responseActive = true
-        // We'll build the full utterance from the transcript
         currentAssistantText = ''
         break
       }
 
-      // We IGNORE OpenAI audio bytes now; all audio comes from ElevenLabs.
+      // Ignore OpenAI audio bytes; we only care about text
       case 'response.audio.delta': {
-        // Do nothing here on purpose
         break
       }
 
-      // Build up the assistant's spoken text from the transcript stream
-      case 'response.audio_transcript.delta': {
+      // Collect assistant text to send to ElevenLabs
+      case 'response.output_text.delta': {
         if (typeof event.delta === 'string') {
           currentAssistantText += event.delta
         }
         break
       }
 
-      // When the transcript for this response is done, send it to ElevenLabs
-      case 'response.audio_transcript.done': {
+      case 'response.audio.done': {
+        // We don't use OpenAI audio
+        break
+      }
+
+      case 'response.done': {
+        responseActive = false
         const textToSpeak = currentAssistantText.trim()
         if (textToSpeak) {
           console.log(`[Assistant][${currentAgent}]`, textToSpeak)
           await speakWithElevenLabs(textToSpeak)
         }
         currentAssistantText = ''
-        responseActive = false
-        // speakWithElevenLabs flips isAssistantSpeaking on/off around playback
-        break
-      }
-
-      case 'response.audio.done': {
-        // We ignore OpenAI audio; ElevenLabs already handled playback.
-        break
-      }
-
-      case 'response.done': {
-        // We already handled speaking on transcript.done
         break
       }
 
