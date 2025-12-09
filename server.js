@@ -147,7 +147,8 @@ wss.on('connection', async (twilioWs, req) => {
 
   // Response + logging helpers
   let responseActive = false
-  let currentAssistantText = '' // text we will send to ElevenLabs
+  let assistantTranscript = ''  // from response.audio_transcript.delta
+  let assistantText = ''        // from response.output_text.delta
 
   // Map of function_call call_id -> toolName
   const functionCallMap = new Map()
@@ -204,7 +205,7 @@ wss.on('connection', async (twilioWs, req) => {
         {
           headers: {
             'xi-api-key': ELEVENLABS_API_KEY,
-            Accept: 'audio/mulaw', // μ-law 8kHz, good for Twilio
+            Accept: 'audio/mulaw', // μ-law 8kHz (Twilio-friendly)
             'Content-Type': 'application/json',
           },
           responseType: 'arraybuffer',
@@ -229,7 +230,6 @@ wss.on('connection', async (twilioWs, req) => {
           })
         )
 
-        // Pace the frames so Twilio plays them cleanly
         await new Promise((resolve) => setTimeout(resolve, FRAME_DURATION_MS))
       }
     } catch (err) {
@@ -252,10 +252,8 @@ wss.on('connection', async (twilioWs, req) => {
         type: 'session.update',
         session: {
           instructions: routerPrompt,
-          // We still accept audio input from Twilio to OpenAI,
-          // but we ignore OpenAI's audio output and synthesize with ElevenLabs.
           modalities: ['audio', 'text'],
-          voice: 'cedar', // ignored for TTS, but fine to leave
+          voice: 'cedar', // ignored for audio output; we use ElevenLabs instead
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           turn_detection: { type: 'server_vad' },
@@ -343,19 +341,28 @@ wss.on('connection', async (twilioWs, req) => {
       // ---- RESPONSE LIFECYCLE ----
       case 'response.created': {
         responseActive = true
-        currentAssistantText = ''
+        assistantTranscript = ''
+        assistantText = ''
         break
       }
 
-      // Ignore OpenAI audio bytes; we only care about text
+      // Ignore OpenAI audio bytes; we only care about text/transcript
       case 'response.audio.delta': {
         break
       }
 
-      // Collect assistant text to send to ElevenLabs
+      // Build up transcript of what it said
+      case 'response.audio_transcript.delta': {
+        if (typeof event.delta === 'string') {
+          assistantTranscript += event.delta
+        }
+        break
+      }
+
+      // Also build up output_text if present (sometimes cleaner than transcript)
       case 'response.output_text.delta': {
         if (typeof event.delta === 'string') {
-          currentAssistantText += event.delta
+          assistantText += event.delta
         }
         break
       }
@@ -367,12 +374,22 @@ wss.on('connection', async (twilioWs, req) => {
 
       case 'response.done': {
         responseActive = false
-        const textToSpeak = currentAssistantText.trim()
+
+        // Prefer transcript; fall back to output_text
+        const textToSpeak =
+          (assistantTranscript && assistantTranscript.trim()) ||
+          (assistantText && assistantText.trim()) ||
+          ''
+
         if (textToSpeak) {
           console.log(`[Assistant][${currentAgent}]`, textToSpeak)
           await speakWithElevenLabs(textToSpeak)
+        } else {
+          console.log('[Assistant] response.done with no text to speak')
         }
-        currentAssistantText = ''
+
+        assistantTranscript = ''
+        assistantText = ''
         break
       }
 
