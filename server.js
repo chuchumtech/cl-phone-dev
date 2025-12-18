@@ -1,6 +1,11 @@
+// server.js (FULL REWRITE)
+// Twilio Media Streams <-> OpenAI Realtime (text+tools) + ElevenLabs (TTS)
+// Plays a static pre-recorded greeting.ulaw immediately on Twilio WS start.
+// Prevents "conversation_already_has_active_response" by queuing response.create.
+// Only generates answers after OpenAI VAD says the caller stopped speaking.
+
 import dotenv from 'dotenv'
 import http from 'http'
-import https from 'https'
 import WebSocket, { WebSocketServer } from 'ws'
 import { supabase } from './supabaseClient.js'
 import { parse as parseUrl } from 'url'
@@ -35,17 +40,30 @@ if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. LOAD STATIC GREETING AUDIO (RAW µ-law 8kHz, NOT WAV/MP3/M4A)
+// 1. LOAD STATIC GREETING AUDIO (RAW µ-law 8kHz, NO WAV HEADER)
 // ---------------------------------------------------------------------------
+// IMPORTANT:
+// - This MUST be raw G.711 µ-law at 8000 Hz, mono (NOT mp3, NOT m4a, NOT wav header).
+// - Put it in your repo so Render deploy includes it.
+// - Recommended file name: ./greeting.ulaw
+//
+// Convert from m4a (iPhone Voice Memo) like:
+//   ffmpeg -i greeting.m4a -ar 8000 -ac 1 -f mulaw -acodec pcm_mulaw greeting.ulaw
+//
 
 let GREETING_AUDIO = null
+let GREETING_FRAMES_B64 = null
 try {
-  // This must be raw G.711 µ-law 8kHz audio bytes (no container header).
-  // Filename extension can be .ulaw, but it is still raw bytes.
   GREETING_AUDIO = fs.readFileSync('./greeting.ulaw')
   console.log('[Greeting] Loaded greeting.ulaw, bytes=', GREETING_AUDIO.length)
+
+  const FRAME_SIZE = 160 // 20 ms @ 8kHz µ-law
+  GREETING_FRAMES_B64 = []
+  for (let i = 0; i < GREETING_AUDIO.length; i += FRAME_SIZE) {
+    GREETING_FRAMES_B64.push(GREETING_AUDIO.subarray(i, i + FRAME_SIZE).toString('base64'))
+  }
 } catch (e) {
-  console.warn('[Greeting] No greeting.ulaw found (or unreadable). Static greeting will be skipped.')
+  console.error('[Greeting] Failed to load ./greeting.ulaw:', e.message)
 }
 
 // ---------------------------------------------------------------------------
@@ -90,7 +108,7 @@ async function reloadPromptsFromDB() {
 await reloadPromptsFromDB()
 
 // ---------------------------------------------------------------------------
-// 3. HTTP SERVER (/refresh-prompts)
+// 3. HTTP SERVER
 // ---------------------------------------------------------------------------
 
 const httpServer = http.createServer(async (req, res) => {
@@ -111,138 +129,143 @@ const httpServer = http.createServer(async (req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer })
 
-httpServer.listen(PORT, () => {
+httpServer.listen(Number(PORT), '0.0.0.0', () => {
   console.log(`[server] Listening on port ${PORT}`)
 })
 
 // ---------------------------------------------------------------------------
-// 4. AXIOS INSTANCE (Keep-Alive for faster ElevenLabs + tool calls)
+// 4. WS SERVER (Twilio <-> OpenAI + ElevenLabs)
 // ---------------------------------------------------------------------------
 
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 })
-const axiosClient = axios.create({
-  timeout: 15000,
-  httpsAgent,
-})
-
-// ---------------------------------------------------------------------------
-// 5. WS SERVER (Twilio <-> OpenAI Realtime + ElevenLabs TTS)
-// ---------------------------------------------------------------------------
-
-wss.on('connection', (twilioWs, req) => {
+wss.on('connection', async (twilioWs, req) => {
   const { pathname } = parseUrl(req.url || '', true)
   if (pathname !== '/twilio-stream') {
     console.log('[WS] Unknown path:', pathname)
-    try { twilioWs.close() } catch {}
+    twilioWs.close()
     return
   }
 
   console.log('[WS] New Twilio Connection')
 
-  const openaiWs = new WebSocket(
-    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1',
-      },
-    }
-  )
+  const openaiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview', {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'OpenAI-Beta': 'realtime=v1',
+    },
+  })
 
-  // -----------------------------
+  // ----------------------------
   // Per-call state
-  // -----------------------------
-
-  let currentAgent = 'router'
+  // ----------------------------
   let callSid = null
   let streamSid = null
 
   let openaiReady = false
-  let twilioStarted = false
 
-  // Speech / response gating (prevents “answers to questions I never asked”)
+  // "speaking" blocks barge-in and prevents response.create from audio
   let isAssistantSpeaking = false
-  let userAudioSinceLastTurn = false
-  let awaitingResponse = false
-  let responseOrigin = null // 'user' | 'tool' | null
+  let isGreetingPlaying = false
 
-  // For text we’ll speak via ElevenLabs
+  let currentAgent = 'router'
+
+  // Response lifecycle control (prevents conversation_already_has_active_response)
+  let responseInProgress = false
+  let pendingResponseCreate = false
+
+  // Only speak when a response was actually requested because of user speech/tool followup
+  let lastResponseIntent = null // 'vad' | 'handoff' | 'tool-followup'
+
+  // Text accumulation from OpenAI (we use this to send to ElevenLabs)
   let assistantTranscript = ''
   let assistantText = ''
 
-  // Tool tracking
+  // Tool call mapping
   const functionCallMap = new Map()
 
-  // -----------------------------
-  // Twilio send helpers
-  // -----------------------------
+  // ----------------------------
+  // Small helpers
+  // ----------------------------
 
-  function sendTwilioMediaFrame(b64) {
-    if (!streamSid) return
-    if (twilioWs.readyState !== WebSocket.OPEN) return
-    twilioWs.send(
-      JSON.stringify({
-        event: 'media',
-        streamSid,
-        media: { payload: b64 },
-      })
-    )
+  function safeSendOpenAI(obj) {
+    if (openaiWs.readyState === WebSocket.OPEN) {
+      openaiWs.send(JSON.stringify(obj))
+    }
+  }
+
+  function requestResponseCreate(reason) {
+    lastResponseIntent = reason
+
+    if (!openaiReady) return
+
+    if (responseInProgress) {
+      pendingResponseCreate = true
+      return
+    }
+
+    safeSendOpenAI({ type: 'response.create' })
   }
 
   async function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms))
   }
 
-  // -----------------------------
-  // Static greeting playback (raw µ-law 8kHz)
-  // -----------------------------
-
-  async function playGreetingFromFile() {
-    if (!GREETING_AUDIO) return
-    if (!streamSid) return
-
+  // -------------------------------------------------------------------------
+  // Static greeting playback (raw µ-law frames)
+  // -------------------------------------------------------------------------
+  async function playGreeting() {
+    if (!GREETING_FRAMES_B64 || !streamSid) return
     console.log('[Greeting] Playing static greeting over Twilio stream')
+
+    isGreetingPlaying = true
     isAssistantSpeaking = true
 
-    const FRAME_SIZE = 160 // 20ms @ 8kHz µ-law
     try {
-      for (let i = 0; i < GREETING_AUDIO.length; i += FRAME_SIZE) {
-        const chunk = GREETING_AUDIO.subarray(i, i + FRAME_SIZE)
-        sendTwilioMediaFrame(chunk.toString('base64'))
+      // 20 ms pacing per frame to keep it real-time and clean
+      for (const b64 of GREETING_FRAMES_B64) {
+        twilioWs.send(
+          JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: b64 },
+          })
+        )
         await sleep(20)
       }
     } catch (e) {
-      console.error('[Greeting] Error while streaming greeting:', e)
+      console.error('[Greeting] Error streaming greeting:', e)
     } finally {
+      isGreetingPlaying = false
       isAssistantSpeaking = false
       console.log('[Greeting] Finished static greeting playback')
     }
   }
 
-  // -----------------------------
-  // ElevenLabs TTS (dynamic)
-  // -----------------------------
-
+  // -------------------------------------------------------------------------
+  // ElevenLabs TTS (dynamic responses)
+  // -------------------------------------------------------------------------
   async function speakWithElevenLabs(text) {
-    const cleaned = (text || '').trim()
-    if (!cleaned) return
-    if (!streamSid) return
-
-    isAssistantSpeaking = true
+    if (!text || !text.trim()) return
+    if (!streamSid) {
+      console.warn('[TTS] No streamSid yet, skipping TTS')
+      return
+    }
 
     try {
+      isAssistantSpeaking = true
+      console.log(`[ElevenLabs] Synthesizing: "${text.substring(0, 80)}..."`)
+
       const modelId = ELEVENLABS_MODEL_ID || 'eleven_turbo_v2_5'
 
-      const resp = await axiosClient.post(
+      const resp = await axios.post(
         `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}?output_format=ulaw_8000`,
         {
-          text: cleaned,
+          text,
           model_id: modelId,
           voice_settings: {
             stability: 0.8,
             similarity_boost: 0.0,
-            style: 0.3,
-            speed: 0.93,
+            style: 0.25,
+            speed: 0.95,
           },
         },
         {
@@ -251,89 +274,346 @@ wss.on('connection', (twilioWs, req) => {
             'Content-Type': 'application/json',
           },
           responseType: 'arraybuffer',
+          timeout: 20000,
         }
       )
 
-      const audioBuffer = Buffer.from(resp.data)
-      const FRAME_SIZE = 160
+      const audio = Buffer.from(resp.data)
+      const FRAME_SIZE = 160 // 20 ms @ 8kHz µ-law
 
-      // Slightly faster than real-time, but still gentle enough not to flood Twilio.
-      // If you hear buffering/lag, increase to 10–20ms.
-      for (let i = 0; i < audioBuffer.length; i += FRAME_SIZE) {
-        const chunk = audioBuffer.subarray(i, i + FRAME_SIZE)
-        sendTwilioMediaFrame(chunk.toString('base64'))
-        await sleep(5)
+      // Real-time pacing prevents distortion/buffer weirdness
+      for (let i = 0; i < audio.length; i += FRAME_SIZE) {
+        const chunk = audio.subarray(i, i + FRAME_SIZE)
+        const b64 = chunk.toString('base64')
+        twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } }))
+        await sleep(20)
       }
-    } catch (err) {
-      console.error('[ElevenLabs] TTS Error:', err?.response?.data || err?.message || err)
+    } catch (e) {
+      console.error('[ElevenLabs] TTS Error:', e?.response?.data || e?.message || e)
     } finally {
       isAssistantSpeaking = false
     }
   }
 
-  // -----------------------------
-  // OpenAI: response.create gating
-  // -----------------------------
+  // -------------------------------------------------------------------------
+  // OpenAI session configuration per agent
+  // -------------------------------------------------------------------------
+  function setRouterSession() {
+    currentAgent = 'router'
+    const routerPrompt = PROMPTS.router || 'You are the Chasdei Lev router agent.'
 
-  function requestAssistantResponse(origin) {
-    if (!openaiReady) return
-    if (!twilioStarted) return
-    if (awaitingResponse) return
+    safeSendOpenAI({
+      type: 'session.update',
+      session: {
+        instructions: routerPrompt,
+        modalities: ['audio', 'text'],
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
+        turn_detection: { type: 'server_vad' },
+        tools: [
+          {
+            type: 'function',
+            name: 'determine_route',
+            description:
+              'Classify caller intent for Chasdei Lev phone calls and decide which agent should handle it.',
+            parameters: {
+              type: 'object',
+              properties: {
+                message: { type: 'string' },
+                ai_classification: { type: 'string' },
+              },
+              required: ['message', 'ai_classification'],
+            },
+          },
+        ],
+      },
+    })
+  }
 
-    // Critical: only respond if user actually spoke (for user-origin)
-    if (origin === 'user' && !userAudioSinceLastTurn) return
+  function setItemsSession() {
+    currentAgent = 'items'
+    const itemsPrompt = PROMPTS.items || 'You are the Chasdei Lev items agent.'
 
-    awaitingResponse = true
-    responseOrigin = origin
-    userAudioSinceLastTurn = false
+    safeSendOpenAI({
+      type: 'session.update',
+      session: {
+        instructions: itemsPrompt,
+        tools: [
+          {
+            type: 'function',
+            name: 'search_items',
+            description:
+              'Search the Chasdei Lev items database and answer kashrus and package questions based ONLY on the provided data.',
+            parameters: {
+              type: 'object',
+              properties: { query: { type: 'string' } },
+              required: ['query'],
+            },
+          },
+          {
+            type: 'function',
+            name: 'handoff_to_router',
+            description: 'Return control to the router agent when the caller asks about something other than items.',
+            parameters: {
+              type: 'object',
+              properties: { question: { type: 'string' } },
+              required: ['question'],
+            },
+          },
+        ],
+      },
+    })
+  }
 
-    try {
-      openaiWs.send(JSON.stringify({ type: 'response.create' }))
-    } catch (e) {
-      awaitingResponse = false
-      responseOrigin = null
+  function setPickupSession() {
+    currentAgent = 'pickup'
+    const pickupPrompt = PROMPTS.pickup || 'You are the Chasdei Lev pickup agent.'
+
+    safeSendOpenAI({
+      type: 'session.update',
+      session: {
+        instructions: pickupPrompt,
+        tools: [
+          {
+            type: 'function',
+            name: 'search_pickup_locations',
+            description:
+              'Search the Chasdei Lev distribution locations database and answer pickup time/location questions based ONLY on the provided data.',
+            parameters: {
+              type: 'object',
+              properties: { location_query: { type: 'string' } },
+              required: ['location_query'],
+            },
+          },
+          {
+            type: 'function',
+            name: 'handoff_to_router',
+            description: 'Return control to the router agent when the caller asks about something other than pickup.',
+            parameters: {
+              type: 'object',
+              properties: { question: { type: 'string' } },
+              required: ['question'],
+            },
+          },
+        ],
+      },
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Agent switching / handoff
+  // -------------------------------------------------------------------------
+  async function handleHandoff(h) {
+    console.log('[Handoff]', h)
+
+    if (h.intent === 'items') {
+      setItemsSession()
+
+      if (h.question) {
+        safeSendOpenAI({
+          type: 'conversation.item.create',
+          item: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: h.question }],
+          },
+        })
+        requestResponseCreate('handoff')
+      }
+      return
+    }
+
+    if (h.intent === 'pickup') {
+      setPickupSession()
+
+      if (h.question) {
+        safeSendOpenAI({
+          type: 'conversation.item.create',
+          item: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: h.question }],
+          },
+        })
+        requestResponseCreate('handoff')
+      }
+      return
+    }
+
+    if (h.intent === 'router') {
+      setRouterSession()
+
+      if (h.question) {
+        safeSendOpenAI({
+          type: 'conversation.item.create',
+          item: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: h.question }],
+          },
+        })
+        requestResponseCreate('handoff')
+      }
+      return
     }
   }
 
-  // -----------------------------
-  // OpenAI WS events
-  // -----------------------------
+  // -------------------------------------------------------------------------
+  // Tool call handler
+  // -------------------------------------------------------------------------
+  async function handleToolCall(toolName, args, callId) {
+    try {
+      // Safety: handle a couple of hallucinated tool names gracefully
+      if (toolName === 'handoff_to_items') toolName = 'determine_route'
+      if (toolName === 'handoff_to_pickup') toolName = 'determine_route'
 
+      if (toolName === 'determine_route') {
+        if (!ROUTER_ENDPOINT) {
+          console.error('[Tool] ROUTER_ENDPOINT not configured')
+          return
+        }
+
+        const resp = await axios.post(
+          ROUTER_ENDPOINT,
+          {
+            ...args,
+            call_sid: callSid,
+            current_agent: currentAgent,
+          },
+          { timeout: 15000 }
+        )
+
+        const output = resp.data || {}
+
+        safeSendOpenAI({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: JSON.stringify(output),
+          },
+        })
+
+        // Router should hand off ONLY to items/pickup; others stay router and speak fallback.
+        if (output.intent === 'items') {
+          await handleHandoff({
+            handoff_from: 'router',
+            intent: 'items',
+            question_type: output.question_type || 'specific',
+            question: output.cleaned_question || null,
+          })
+          return
+        }
+
+        if (output.intent === 'pickup') {
+          await handleHandoff({
+            handoff_from: 'router',
+            intent: 'pickup',
+            question_type: output.question_type || 'specific',
+            question: output.cleaned_question || null,
+          })
+          return
+        }
+
+        // For orders/meta/unknown, the router prompt should speak the correct line.
+        // We DO NOT force another response.create here because the model is already in a response.
+        return
+      }
+
+      if (toolName === 'search_items') {
+        if (!ITEM_SEARCH_ENDPOINT) {
+          console.error('[Tool] ITEM_SEARCH_ENDPOINT not configured')
+          return
+        }
+
+        const resp = await axios.post(
+          ITEM_SEARCH_ENDPOINT,
+          { ...args, call_sid: callSid },
+          { timeout: 15000 }
+        )
+
+        const output = resp.data || {}
+
+        safeSendOpenAI({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: JSON.stringify(output),
+          },
+        })
+
+        // IMPORTANT:
+        // Do NOT send response.create here.
+        // The OpenAI response that requested the tool is still active; sending response.create causes
+        // "conversation_already_has_active_response".
+        return
+      }
+
+      if (toolName === 'search_pickup_locations') {
+        if (!PICKUP_ENDPOINT) {
+          console.error('[Tool] PICKUP_ENDPOINT not configured')
+          return
+        }
+
+        const resp = await axios.post(
+          PICKUP_ENDPOINT,
+          { ...args, call_sid: callSid },
+          { timeout: 15000 }
+        )
+
+        const output = resp.data || {}
+
+        safeSendOpenAI({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: JSON.stringify(output),
+          },
+        })
+
+        // Do NOT send response.create here (same reason as above)
+        return
+      }
+
+      if (toolName === 'handoff_to_router') {
+        const cleanedQuestion = typeof args.question === 'string' ? args.question : null
+
+        safeSendOpenAI({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: JSON.stringify({ ok: true }),
+          },
+        })
+
+        await handleHandoff({
+          handoff_from: currentAgent,
+          intent: 'router',
+          question_type: 'specific',
+          question: cleanedQuestion,
+        })
+
+        return
+      }
+
+      console.warn('[Tool] Unknown toolName:', toolName)
+    } catch (e) {
+      console.error('[Tool] Error in handleToolCall', toolName, e?.response?.data || e)
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // OpenAI WS events
+  // -------------------------------------------------------------------------
   openaiWs.on('open', () => {
     console.log('[OpenAI] Connected')
-
-    const routerPrompt = PROMPTS.router || 'You are the Chasdei Lev router agent.'
-
-    openaiWs.send(
-      JSON.stringify({
-        type: 'session.update',
-        session: {
-          instructions: routerPrompt,
-          modalities: ['audio', 'text'],
-          input_audio_format: 'g711_ulaw',
-          output_audio_format: 'g711_ulaw',
-          turn_detection: { type: 'server_vad' },
-          tools: [
-            {
-              type: 'function',
-              name: 'determine_route',
-              description:
-                'Classify caller intent for Chasdei Lev phone calls and decide which agent should handle it.',
-              parameters: {
-                type: 'object',
-                properties: {
-                  message: { type: 'string' },
-                  ai_classification: { type: 'string' },
-                },
-                required: ['message', 'ai_classification'],
-              },
-            },
-          ],
-        },
-      })
-    )
-
     openaiReady = true
+
+    // Always start on Router instructions (router should NOT greet; greeting is your .ulaw file)
+    setRouterSession()
   })
 
   openaiWs.on('message', async (raw) => {
@@ -345,14 +625,23 @@ wss.on('connection', (twilioWs, req) => {
     }
 
     switch (event.type) {
+      // Gate: only answer after caller finished speaking
+      case 'input_audio_buffer.speech_stopped': {
+        // Ignore if we are currently playing greeting or speaking TTS
+        if (isAssistantSpeaking || isGreetingPlaying) break
+        requestResponseCreate('vad')
+        break
+      }
+
       case 'response.created': {
+        responseInProgress = true
         assistantTranscript = ''
         assistantText = ''
         break
       }
 
-      // We ignore OpenAI audio bytes entirely; we speak with ElevenLabs
       case 'response.audio.delta': {
+        // ignored; we use ElevenLabs
         break
       }
 
@@ -366,20 +655,13 @@ wss.on('connection', (twilioWs, req) => {
         break
       }
 
-      // These events indicate OpenAI heard speech boundaries (server_vad)
-      case 'input_audio_buffer.speech_stopped':
-      case 'input_audio_buffer.committed': {
-        // Trigger a response only if the user actually spoke and we're not speaking
-        if (!isAssistantSpeaking) {
-          requestAssistantResponse('user')
-        }
-        break
-      }
-
       case 'response.output_item.added': {
         const item = event.item
-        if (item?.type === 'function_call' && item.call_id && item.name) {
-          functionCallMap.set(item.call_id, item.name)
+        if (item?.type === 'function_call') {
+          if (item.call_id && item.name) {
+            functionCallMap.set(item.call_id, item.name)
+            console.log('[Tool] function_call started', item.call_id, item.name)
+          }
         }
         break
       }
@@ -401,31 +683,33 @@ wss.on('connection', (twilioWs, req) => {
       }
 
       case 'response.done': {
-        awaitingResponse = false
+        responseInProgress = false
+
+        // If we queued a response.create during an active response, send it now.
+        if (pendingResponseCreate) {
+          pendingResponseCreate = false
+          requestResponseCreate(lastResponseIntent || 'vad')
+        }
 
         const textToSpeak = (assistantTranscript || assistantText || '').trim()
 
-        // If OpenAI produced text but we did NOT explicitly request a response,
-        // suppress it to prevent “answers to things I never asked.”
-        if (!responseOrigin) {
-          assistantTranscript = ''
-          assistantText = ''
-          break
-        }
+        // Only speak if we have real content AND we were triggered by user speech/handoff.
+        if (!textToSpeak) break
+        if (!lastResponseIntent) break
 
-        if (textToSpeak) {
-          console.log(`[Assistant][${currentAgent}]`, textToSpeak)
-          await speakWithElevenLabs(textToSpeak)
-        }
+        // Extra guard: router sometimes tries to say identity/meta immediately; let it speak normally.
+        console.log(`[Assistant][${currentAgent}]`, textToSpeak)
+        await speakWithElevenLabs(textToSpeak)
 
-        responseOrigin = null
-        assistantTranscript = ''
-        assistantText = ''
+        // Reset so we don’t speak “extra” followups unless another VAD stop/handoff happens.
+        lastResponseIntent = null
         break
       }
 
       case 'error': {
+        // Do not crash; log and keep going
         console.error('[OpenAI error event]', event)
+        // If the error is active_response, we rely on our queueing; nothing else needed here.
         break
       }
 
@@ -436,18 +720,21 @@ wss.on('connection', (twilioWs, req) => {
 
   openaiWs.on('close', () => {
     console.log('[OpenAI] Socket closed')
-    try { twilioWs.close() } catch {}
+    try {
+      twilioWs.close()
+    } catch {}
   })
 
   openaiWs.on('error', (err) => {
     console.error('[OpenAI] WS Error:', err)
-    try { twilioWs.close() } catch {}
+    try {
+      twilioWs.close()
+    } catch {}
   })
 
-  // -----------------------------
+  // -------------------------------------------------------------------------
   // Twilio WS events
-  // -----------------------------
-
+  // -------------------------------------------------------------------------
   twilioWs.on('message', async (raw) => {
     let msg
     try {
@@ -459,399 +746,47 @@ wss.on('connection', (twilioWs, req) => {
     if (msg.event === 'start') {
       callSid = msg.start?.callSid || null
       streamSid = msg.start?.streamSid || null
-      twilioStarted = true
       console.log('[Twilio] Stream Started:', callSid, 'streamSid=', streamSid)
 
-      // Start greeting immediately; OpenAI can initialize in parallel.
-      if (GREETING_AUDIO) {
-        playGreetingFromFile().catch((e) => console.error('[Greeting] Playback error:', e))
+      // Play greeting immediately; OpenAI boots in parallel.
+      if (GREETING_FRAMES_B64?.length) {
+        playGreeting().catch((e) => console.error('[Greeting] playGreeting error:', e))
       }
       return
     }
 
     if (msg.event === 'media') {
-      // No-barge-in: drop user audio while assistant is speaking (including greeting).
-      if (isAssistantSpeaking) return
+      // No-barge-in: drop user audio while we are playing greeting or speaking TTS
+      if (isAssistantSpeaking || isGreetingPlaying) return
       if (!openaiReady) return
 
-      userAudioSinceLastTurn = true
-
-      try {
-        openaiWs.send(
-          JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: msg.media.payload,
-          })
-        )
-      } catch {}
+      safeSendOpenAI({
+        type: 'input_audio_buffer.append',
+        audio: msg.media.payload,
+      })
       return
     }
 
     if (msg.event === 'stop') {
       console.log('[Twilio] Call ended', callSid)
-      try { openaiWs.close() } catch {}
+      try {
+        openaiWs.close()
+      } catch {}
       return
     }
   })
 
   twilioWs.on('close', () => {
     console.log('[WS] Twilio websocket closed')
-    try { openaiWs.close() } catch {}
+    try {
+      openaiWs.close()
+    } catch {}
   })
 
   twilioWs.on('error', (err) => {
     console.error('[WS] Twilio WS Error:', err)
-    try { openaiWs.close() } catch {}
-  })
-
-  // -------------------------------------------------------------------------
-  // TOOL CALLS
-  // -------------------------------------------------------------------------
-
-  async function handleToolCall(toolName, args, callId) {
     try {
-      if (toolName === 'determine_route') {
-        if (!ROUTER_ENDPOINT) {
-          console.error('[Tool] ROUTER_ENDPOINT not configured')
-          openaiWs.send(
-            JSON.stringify({
-              type: 'conversation.item.create',
-              item: {
-                type: 'function_call_output',
-                call_id: callId,
-                output: JSON.stringify({ intent: 'unknown' }),
-              },
-            })
-          )
-          requestAssistantResponse('tool')
-          return
-        }
-
-        const resp = await axiosClient.post(ROUTER_ENDPOINT, {
-          ...args,
-          call_sid: callSid,
-          current_agent: currentAgent,
-        })
-
-        const output = resp.data || {}
-
-        openaiWs.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'function_call_output',
-              call_id: callId,
-              output: JSON.stringify(output),
-            },
-          })
-        )
-
-        if (output.intent === 'items') {
-          await handleHandoff({
-            handoff_from: 'router',
-            intent: 'items',
-            question_type: output.question_type || 'specific',
-            question: output.cleaned_question || null,
-          })
-          return
-        }
-
-        if (output.intent === 'pickup') {
-          await handleHandoff({
-            handoff_from: 'router',
-            intent: 'pickup',
-            question_type: output.question_type || 'specific',
-            question: output.cleaned_question || null,
-          })
-          return
-        }
-
-        // orders/meta/unknown => let router say its fallback line
-        requestAssistantResponse('tool')
-        return
-      }
-
-      if (toolName === 'search_items') {
-        if (!ITEM_SEARCH_ENDPOINT) {
-          console.error('[Tool] ITEM_SEARCH_ENDPOINT not configured')
-          openaiWs.send(
-            JSON.stringify({
-              type: 'conversation.item.create',
-              item: {
-                type: 'function_call_output',
-                call_id: callId,
-                output: JSON.stringify({ results: [], error: 'ITEM_SEARCH_ENDPOINT not configured' }),
-              },
-            })
-          )
-          requestAssistantResponse('tool')
-          return
-        }
-
-        const resp = await axiosClient.post(ITEM_SEARCH_ENDPOINT, {
-          ...args,
-          call_sid: callSid,
-        })
-
-        const output = resp.data || {}
-
-        openaiWs.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'function_call_output',
-              call_id: callId,
-              output: JSON.stringify(output),
-            },
-          })
-        )
-
-        requestAssistantResponse('tool')
-        return
-      }
-
-      if (toolName === 'search_pickup_locations') {
-        if (!PICKUP_ENDPOINT) {
-          console.error('[Tool] PICKUP_ENDPOINT not configured')
-          openaiWs.send(
-            JSON.stringify({
-              type: 'conversation.item.create',
-              item: {
-                type: 'function_call_output',
-                call_id: callId,
-                output: JSON.stringify({ results: [], error: 'PICKUP_ENDPOINT not configured' }),
-              },
-            })
-          )
-          requestAssistantResponse('tool')
-          return
-        }
-
-        const resp = await axiosClient.post(PICKUP_ENDPOINT, {
-          ...args,
-          call_sid: callSid,
-        })
-
-        const output = resp.data || {}
-
-        openaiWs.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'function_call_output',
-              call_id: callId,
-              output: JSON.stringify(output),
-            },
-          })
-        )
-
-        requestAssistantResponse('tool')
-        return
-      }
-
-      if (toolName === 'handoff_to_router') {
-        const cleanedQuestion = typeof args.question === 'string' ? args.question.trim() : ''
-
-        openaiWs.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'function_call_output',
-              call_id: callId,
-              output: JSON.stringify({ ok: true }),
-            },
-          })
-        )
-
-        await handleHandoff({
-          handoff_from: currentAgent,
-          intent: 'router',
-          question_type: 'specific',
-          question: cleanedQuestion || null,
-        })
-
-        return
-      }
-
-      console.warn('[Tool] Unknown toolName:', toolName)
-    } catch (err) {
-      console.error('[Tool] Error in handleToolCall', toolName, err?.response?.data || err)
-      try {
-        openaiWs.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'function_call_output',
-              call_id: callId,
-              output: JSON.stringify({ error: 'tool_failed' }),
-            },
-          })
-        )
-        requestAssistantResponse('tool')
-      } catch {}
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // AGENT SWITCHING
-  // -------------------------------------------------------------------------
-
-  async function handleHandoff(h) {
-    console.log('[Handoff]', h)
-    if (!h || !h.intent) return
-
-    if (h.intent === 'items') {
-      currentAgent = 'items'
-      const itemsPrompt = PROMPTS.items || 'You are the Chasdei Lev items agent.'
-
-      openaiWs.send(
-        JSON.stringify({
-          type: 'session.update',
-          session: {
-            instructions: itemsPrompt,
-            tools: [
-              {
-                type: 'function',
-                name: 'search_items',
-                description:
-                  'Search the Chasdei Lev items database and answer kashrus and package questions based ONLY on the provided data.',
-                parameters: {
-                  type: 'object',
-                  properties: { query: { type: 'string' } },
-                  required: ['query'],
-                },
-              },
-              {
-                type: 'function',
-                name: 'handoff_to_router',
-                description:
-                  'Return control to the router agent when the caller asks about something other than items.',
-                parameters: {
-                  type: 'object',
-                  properties: { question: { type: 'string' } },
-                  required: ['question'],
-                },
-              },
-            ],
-          },
-        })
-      )
-
-      if (h.question && typeof h.question === 'string' && h.question.trim()) {
-        openaiWs.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'message',
-              role: 'user',
-              content: [{ type: 'input_text', text: h.question.trim() }],
-            },
-          })
-        )
-        requestAssistantResponse('tool')
-      }
-
-      return
-    }
-
-    if (h.intent === 'pickup') {
-      currentAgent = 'pickup'
-      const pickupPrompt = PROMPTS.pickup || 'You are the Chasdei Lev pickup agent.'
-
-      openaiWs.send(
-        JSON.stringify({
-          type: 'session.update',
-          session: {
-            instructions: pickupPrompt,
-            tools: [
-              {
-                type: 'function',
-                name: 'search_pickup_locations',
-                description:
-                  'Search the Chasdei Lev distribution locations database and answer pickup time/location questions based ONLY on the provided data.',
-                parameters: {
-                  type: 'object',
-                  properties: { location_query: { type: 'string' } },
-                  required: ['location_query'],
-                },
-              },
-              {
-                type: 'function',
-                name: 'handoff_to_router',
-                description:
-                  'Return control to the router agent when the caller asks about something other than pickup.',
-                parameters: {
-                  type: 'object',
-                  properties: { question: { type: 'string' } },
-                  required: ['question'],
-                },
-              },
-            ],
-          },
-        })
-      )
-
-      if (h.question && typeof h.question === 'string' && h.question.trim()) {
-        openaiWs.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'message',
-              role: 'user',
-              content: [{ type: 'input_text', text: h.question.trim() }],
-            },
-          })
-        )
-        requestAssistantResponse('tool')
-      }
-
-      return
-    }
-
-    if (h.intent === 'router') {
-      currentAgent = 'router'
-      const routerPrompt = PROMPTS.router || 'You are the Chasdei Lev router agent.'
-
-      openaiWs.send(
-        JSON.stringify({
-          type: 'session.update',
-          session: {
-            instructions: routerPrompt,
-            tools: [
-              {
-                type: 'function',
-                name: 'determine_route',
-                description:
-                  'Classify caller intent for Chasdei Lev phone calls and decide which agent should handle it.',
-                parameters: {
-                  type: 'object',
-                  properties: {
-                    message: { type: 'string' },
-                    ai_classification: { type: 'string' },
-                  },
-                  required: ['message', 'ai_classification'],
-                },
-              },
-            ],
-          },
-        })
-      )
-
-      if (h.question && typeof h.question === 'string' && h.question.trim()) {
-        openaiWs.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'message',
-              role: 'user',
-              content: [{ type: 'input_text', text: h.question.trim() }],
-            },
-          })
-        )
-        requestAssistantResponse('tool')
-      }
-
-      return
-    }
-  }
+      openaiWs.close()
+    } catch {}
+  })
 })
